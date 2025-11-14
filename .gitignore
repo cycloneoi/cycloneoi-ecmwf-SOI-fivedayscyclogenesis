@@ -1,1 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+*.bufr
+*.grib
+*.grib2
 
