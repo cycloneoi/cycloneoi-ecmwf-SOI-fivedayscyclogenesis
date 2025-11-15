@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Produits ECMWF à 5 jours pour l'océan Indien Sud (style CycloneOI).
+Produits ECMWF à 10 jours pour l'océan Indien Sud (style CycloneOI).
 
 Pour chaque run :
 - Filtre les systèmes tropicaux dans l'océan Indien Sud.
@@ -10,9 +10,9 @@ Pour chaque run :
     * ensemble_tracks.geojson
     * mean_track.geojson
     * strike_probability.tif
-    * strike_probability.png          (carte de cyclogenèse)
+    * strike_probability.png          (carte de cyclogenèse sur 10 jours)
     * ensemble_tracks.png             (vue des trajectoires d'ensemble)
-    * max_wind.png                    (heatmap du vent max prévu)
+    * max_wind.png                    (heatmap du vent max prévu, en km/h)
 
 - Met également à jour output/latest/ :
     * cyclogenesis.png      (copie du strike_probability du système principal)
@@ -33,7 +33,7 @@ import shutil
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
+from matplotlib.colors import ListedColormap, BoundaryNorm
 import rasterio
 
 from tropidash_utils import utils_tracks as tracks
@@ -73,6 +73,20 @@ LAT_MAX = 0.0
 # On enlève les "faux" systèmes
 MIN_STORM_ID = 70
 
+# Catégories de vent (en km/h) dérivées des seuils en kt :
+#   - Tempête : 34–63 kt  ≈ 63–117 km/h
+#   - Cat.1   : 64–82 kt  ≈ 118–152 km/h
+#   - Cat.2   : 83–94 kt  ≈ 153–174 km/h
+#   - Cat.3+  : ≥95 kt    ≈ ≥176 km/h
+WIND_CAT_BOUNDS = [0, 63, 118, 153, 176, 260]  # km/h
+WIND_CAT_LABELS = [
+    "< 63 km/h",
+    "Tempête (63–117 km/h)",
+    "Cat.1 (118–152 km/h)",
+    "Cat.2 (153–175 km/h)",
+    "Cat.3+ (≥176 km/h)",
+]
+
 
 # ================== FONCTIONS UTILITAIRES ==================
 
@@ -94,7 +108,7 @@ def to_geojson_linestring_list(locs_list, properties_list=None):
 
 
 def base_axes_with_basin(ax):
-    """Applique un look 'carte océan Indien Sud' pour les placeholders."""
+    """Applique un look 'carte océan Indien Sud' pour les placeholders et les cartes."""
     ax.set_facecolor(COI_BG)
     # cadre du bassin
     ax.plot(
@@ -145,7 +159,7 @@ def save_strike_map_png(tif_path, png_path, title):
     cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
     cbar.ax.tick_params(labelsize=8, colors=COI_TEXT)
     cbar.outline.set_edgecolor("#4b5563")
-    cbar.set_label("Probabilité de cyclogenèse (%)", color=COI_TEXT, fontsize=8)
+    cbar.set_label("Probabilité de cyclogenèse (%) sur 10 jours", color=COI_TEXT, fontsize=8)
 
     plt.tight_layout(pad=0.6)
     plt.savefig(png_path, bbox_inches="tight", pad_inches=0.2, dpi=150, facecolor=COI_BG)
@@ -157,7 +171,7 @@ def create_placeholder_png(path, subtitle, message=None):
     if message is None:
         message = (
             "Aucun système suspecté\n"
-            "pour les 5 prochains jours\n"
+            "pour les 10 prochains jours\n"
             "sur l'océan Indien Sud"
         )
 
@@ -231,18 +245,26 @@ def create_ensemble_overview_png(locations_f, locations_avg, png_path, storm_id)
 
 
 def create_max_wind_heatmap(df_storm, png_path, storm_id):
-    """Heatmap vent max prévu (m/s) sur le bassin pour ce système."""
+    """Heatmap vent max prévu (km/h) sur le bassin pour ce système.
+
+    On agrège tous les pas de temps jusqu'à +240 h (~10 jours) et on
+    convertit les vitesses de m/s en km/h. La colorisation suit les
+    catégories de vent (tempête, cat.1, cat.2, cat.3+).
+    """
     df = df_storm.dropna(subset=["latitude", "longitude", "windSpeedAt10M"]).copy()
     if df.empty:
         subtitle = f"Système {storm_id} – données vent indisponibles"
         create_placeholder_png(png_path, subtitle, message="Vent max ECMWF indisponible")
         return
 
+    # Conversion en km/h
+    df["wind_kmh"] = df["windSpeedAt10M"] * 3.6
+
     lats = df.latitude.to_numpy()
     lons = df.longitude.to_numpy()
-    winds = df.windSpeedAt10M.to_numpy()
+    winds_kmh = df.wind_kmh.to_numpy()
 
-    # grille grossière suffisante pour un produit web
+    # grille suffisamment fine pour un produit web
     lat_bins = np.arange(max(lats.min() - 2, LAT_MIN), min(lats.max() + 2, LAT_MAX) + 0.1, 1.0)
     lon_bins = np.arange(max(lons.min() - 2, LON_MIN), min(lons.max() + 2, LON_MAX) + 0.1, 1.0)
 
@@ -256,7 +278,7 @@ def create_max_wind_heatmap(df_storm, png_path, storm_id):
         jj = lon_idx[i]
         if ii < 0 or jj < 0 or ii >= grid.shape[0] or jj >= grid.shape[1]:
             continue
-        w = winds[i]
+        w = winds_kmh[i]
         if np.isnan(grid[ii, jj]) or w > grid[ii, jj]:
             grid[ii, jj] = w
 
@@ -265,27 +287,43 @@ def create_max_wind_heatmap(df_storm, png_path, storm_id):
     ax.set_facecolor(COI_BG)
 
     data = np.ma.masked_invalid(grid)
-    cmap = plt.cm.inferno
+
+    # Colormap discrète par catégories de vent
+    cmap = ListedColormap([
+        "#172554",  # <63 km/h
+        "#22c55e",  # tempête
+        "#facc15",  # cat1
+        "#fb923c",  # cat2
+        "#dc2626",  # cat3+
+    ])
+    norm = BoundaryNorm(WIND_CAT_BOUNDS, cmap.N)
 
     im = ax.imshow(
         data,
         extent=(lon_bins[0], lon_bins[-1], lat_bins[0], lat_bins[-1]),
         origin="lower",
         cmap=cmap,
+        norm=norm,
     )
 
     base_axes_with_basin(ax)
     ax.set_title(
-        f"Vent max prévu (m/s) – Système {storm_id}",
+        f"Vent maximum prévu (km/h) sur 10 jours – Système {storm_id}",
         fontsize=13,
         color=COI_GOLD,
         pad=10,
     )
 
-    cbar = fig.colorbar(im, ax=ax, fraction=0.028, pad=0.02)
+    # Colorbar avec labels de catégories
+    ticks = [
+        (WIND_CAT_BOUNDS[i] + WIND_CAT_BOUNDS[i + 1]) / 2
+        for i in range(len(WIND_CAT_LABELS))
+    ]
+    cbar = fig.colorbar(im, ax=ax, fraction=0.028, pad=0.02, ticks=ticks)
     cbar.ax.tick_params(labelsize=8, colors=COI_TEXT)
     cbar.outline.set_edgecolor("#4b5563")
-    cbar.set_label("Vent max (m/s)", color=COI_TEXT, fontsize=8)
+    cbar.set_ticklabels(WIND_CAT_LABELS)
+    cbar.set_label("Vent maximum prévu (km/h) – catégories", color=COI_TEXT, fontsize=8)
 
     plt.tight_layout(pad=0.7)
     plt.savefig(png_path, bbox_inches="tight", pad_inches=0.25, dpi=150, facecolor=COI_BG)
@@ -345,14 +383,14 @@ def process_storm(df_storms_forecast, storm_id):
     save_strike_map_png(
         target_tif,
         cyclo_png,
-        title="Probabilité de cyclogenèse à 5 jours – Océan Indien Sud",
+        title="Probabilité de cyclogenèse à 10 jours – Océan Indien Sud",
     )
 
     # --- Vue ensembles
     ens_png = storm_dir / "ensemble_tracks.png"
     create_ensemble_overview_png(locations_f, locations_avg, ens_png, storm_id)
 
-    # --- Heatmap vent max
+    # --- Heatmap vent max (km/h)
     maxwind_png = storm_dir / "max_wind.png"
     create_max_wind_heatmap(df_storm, maxwind_png, storm_id)
 
@@ -362,7 +400,7 @@ def process_storm(df_storms_forecast, storm_id):
 # ================== MAIN ==================
 
 def main():
-    print(f"=== Génération produits IO Sud pour run {RUN_DATE:%Y-%m-%d} ===")
+    print(f"=== Génération produits IO Sud pour run {RUN_DATE:%Y-%m-%d} (10 jours) ===")
 
     print("Téléchargement des données ECMWF (download_tracks_forecast)…")
     start_date = tracks.download_tracks_forecast(RUN_DATE)
