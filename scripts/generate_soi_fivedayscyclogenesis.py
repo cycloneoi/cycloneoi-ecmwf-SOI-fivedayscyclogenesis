@@ -42,9 +42,13 @@ else:
     now = datetime.utcnow()
     RUN_DATE = datetime(now.year, now.month, now.day, 0, 0)
 
-# Dossier de sortie
+# Dossiers
 BASE_OUTPUT = Path("output") / RUN_DATE.strftime("%Y%m%d")
 BASE_OUTPUT.mkdir(parents=True, exist_ok=True)
+
+DATA_DIR = Path("data")
+TRACKS_DIR = DATA_DIR / "tracks"
+TRACKS_DIR.mkdir(parents=True, exist_ok=True)  # important pour le téléchargement BUFR
 
 # Boîte géographique Sud-Ouest océan Indien
 LON_MIN = 20.0
@@ -95,7 +99,6 @@ def save_strike_map_png(tif_path, png_path):
     data = np.ma.masked_where(data <= 0, data)
 
     # Palette inspirée de TropiDash
-    # (du vert faible au bleu / violet fort)
     palette = [
         "#8df52c", "#6ae24c", "#61bb30", "#508b15",
         "#057941", "#2397d1", "#557ff3", "#143cdc",
@@ -103,16 +106,13 @@ def save_strike_map_png(tif_path, png_path):
     ]
 
     plt.figure(figsize=(8, 6))
-    # imshow avec extent pour être géoréférencé si tu veux l'utiliser
+    from matplotlib.colors import ListedColormap
     plt.imshow(
         data,
         extent=(bounds.left, bounds.right, bounds.bottom, bounds.top),
-        origin="upper"
+        origin="upper",
+        cmap=ListedColormap(palette),
     )
-    # on applique une colormap discrète
-    from matplotlib.colors import ListedColormap
-    plt.set_cmap(ListedColormap(palette))
-
     plt.axis("off")
     plt.tight_layout(pad=0)
     plt.savefig(png_path, bbox_inches="tight", pad_inches=0, dpi=150)
@@ -190,15 +190,19 @@ def process_storm(df_storms_forecast, storm_id):
 def main():
     print(f"=== Génération produits SOI pour run {RUN_DATE} ===")
 
-    # 1) Charger toutes les tempêtes à partir de la date RUN_DATE
+    # 1) Télécharger les données ECMWF (BUFR) si nécessaire
+    print("Téléchargement des données ECMWF (download_tracks_forecast)…")
+    start_date = tracks.download_tracks_forecast(RUN_DATE)
+
+    # 2) Charger toutes les tempêtes à partir du fichier BUFR
     print("Téléchargement / chargement des données ECMWF (create_storms_df)…")
-    df_storms = tracks.create_storms_df(RUN_DATE)
+    df_storms = tracks.create_storms_df(start_date)
 
     if df_storms.empty:
         print("Aucune tempête détectée dans les données ECMWF.")
         return
 
-    # 2) Filtrer le bassin Sud-Ouest océan Indien
+    # 3) Filtrer le bassin Sud-Ouest océan Indien
     print("Filtrage sur le bassin Sud-Ouest océan Indien…")
 
     df_basin = df_storms[
@@ -206,7 +210,7 @@ def main():
         (df_storms.latitude > LAT_MIN) &
         (df_storms.longitude >= LON_MIN) &
         (df_storms.longitude <= LON_MAX) &
-        (df_storms.stormIdentifier.astype(int) >= MIN_STORM_ID)
+        (df_storms.stormIdentifier.astype(str) >= str(MIN_STORM_ID))
     ].copy()
 
     if df_basin.empty:
@@ -216,7 +220,7 @@ def main():
     storm_ids = sorted(df_basin.stormIdentifier.unique())
     print(f"Systèmes identifiés dans le SOI : {storm_ids}")
 
-    # 3) Traiter chaque système
+    # 4) Traiter chaque système
     for sid in storm_ids:
         process_storm(df_basin, sid)
 
