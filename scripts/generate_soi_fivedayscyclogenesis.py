@@ -3,7 +3,7 @@
 
 """
 Génération quotidienne des produits de cyclogenèse à 5 jours
-pour le Sud-Ouest océan Indien à partir des données ECMWF,
+pour l'océan Indien Sud à partir des données ECMWF,
 en réutilisant les fonctions de TropiDash.
 
 Résultat : pour chaque système identifié dans le bassin,
@@ -12,13 +12,15 @@ on produit dans output/YYYYMMDD/storm_<id>/ :
   - mean_track.geojson
   - strike_probability.tif
   - strike_probability.png
+  - ensemble_tracks.png  (vue des trajectoires d'ensemble)
 
-En plus, on crée toujours :
+En plus, on crée toujours dans output/latest/ :
+  - cyclogenesis.png      (carte de probabilité principale)
+  - ensemble_tracks.png   (vue des trajectoires d'ensemble)
+  - strike_probability.png (alias de cyclogenesis.png pour compat)
 
-  output/latest/strike_probability.png
-
-- s'il y a des systèmes : copie de la carte du premier système
-- s'il n'y a aucun système : image "aucun risque de cyclogenèse"
+Si aucun système n'est détecté, ces images sont remplacées par
+un visuel "Aucun système suspecté" au style CycloneOI.
 """
 
 from pathlib import Path
@@ -37,6 +39,11 @@ from tropidash_utils import utils_tracks as tracks
 
 # ================== PARAMÈTRES GÉNÉRAUX ==================
 
+# Style CycloneOI
+COI_BG = "#050608"
+COI_GOLD = "#f4c542"
+COI_TEXT = "#e6eaf0"
+
 # Si tu veux forcer une date de run depuis le workflow :
 #   env:
 #     COI_RUN_DATE: YYYYMMDD
@@ -45,7 +52,7 @@ run_date_str = os.environ.get("COI_RUN_DATE")
 if run_date_str:
     RUN_DATE = datetime.strptime(run_date_str, "%Y%m%d")
 else:
-    # par défaut : date UTC du jour à 00Z
+    # par défaut : date UTC du jour (00Z pour ce produit ECMWF)
     now = datetime.utcnow()
     RUN_DATE = datetime(now.year, now.month, now.day, 0, 0)
 
@@ -53,7 +60,7 @@ else:
 BASE_OUTPUT = Path("output") / RUN_DATE.strftime("%Y%m%d")
 BASE_OUTPUT.mkdir(parents=True, exist_ok=True)
 
-# Dossier "latest" qui contiendra toujours l'image à afficher sur le site
+# Dossier "latest" qui contiendra toujours les images à afficher sur le site
 LATEST_DIR = Path("output") / "latest"
 LATEST_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -62,11 +69,12 @@ DATA_DIR = Path("data")
 TRACKS_DIR = DATA_DIR / "tracks"
 TRACKS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Boîte géographique Sud-Ouest océan Indien
+# Boîte géographique pour TOUT l'océan Indien Sud
+# (grosso modo Afrique de l'Est -> Australie, équateur -> 60°S)
 LON_MIN = 20.0
 LON_MAX = 120.0
-LAT_MIN = -45.0   # Sud
-LAT_MAX = 0.0     # Équateur
+LAT_MIN = -60.0
+LAT_MAX = 0.0
 
 # On enlève les "faux" systèmes (recommandation du tuto TropiDash)
 MIN_STORM_ID = 70  # stormIdentifier >= 70
@@ -98,10 +106,10 @@ def to_geojson_linestring_list(locs_list, properties_list=None):
     return {"type": "FeatureCollection", "features": features}
 
 
-def save_strike_map_png(tif_path, png_path):
+def save_strike_map_png(tif_path, png_path, title="Cyclogenèse à 5 jours – Océan Indien Sud"):
     """
-    Convertit le GeoTIFF de strike probability en PNG simple
-    (sans axes) pour affichage direct sur le site.
+    Convertit le GeoTIFF de strike probability en PNG stylé CycloneOI
+    pour affichage direct sur le site.
     """
     with rasterio.open(tif_path) as r:
         data = r.read(1)
@@ -110,14 +118,16 @@ def save_strike_map_png(tif_path, png_path):
     # On masque les zéros (pas de probabilité)
     data = np.ma.masked_where(data <= 0, data)
 
-    # Palette inspirée de TropiDash
+    # Palette inspirée de TropiDash mais adaptée CycloneOI
     palette = [
         "#8df52c", "#6ae24c", "#61bb30", "#508b15",
         "#057941", "#2397d1", "#557ff3", "#143cdc",
-        "#3910b4", "#1e0063"
+        "#3910b4", COI_GOLD
     ]
 
     plt.figure(figsize=(8, 6))
+    plt.gcf().patch.set_facecolor(COI_BG)
+
     plt.imshow(
         data,
         extent=(bounds.left, bounds.right, bounds.bottom, bounds.top),
@@ -125,37 +135,106 @@ def save_strike_map_png(tif_path, png_path):
         cmap=ListedColormap(palette),
     )
     plt.axis("off")
-    plt.tight_layout(pad=0)
-    plt.savefig(png_path, bbox_inches="tight", pad_inches=0, dpi=150)
+
+    # Titre CycloneOI
+    plt.title(
+        title,
+        fontsize=14,
+        color=COI_GOLD,
+        pad=12
+    )
+
+    plt.tight_layout(pad=0.5)
+    plt.savefig(png_path, bbox_inches="tight", pad_inches=0.1, dpi=150, facecolor=COI_BG)
     plt.close()
 
 
-def create_placeholder_png(path):
+def create_placeholder_png(path, subtitle):
     """
     Crée une image simple indiquant qu'aucun système n'est suivi
-    dans le Sud-Ouest océan Indien pour les 5 prochains jours.
+    dans l'océan Indien Sud sur les 5 prochains jours.
     """
-    plt.figure(figsize=(6, 4))
-    plt.text(
+    fig, ax = plt.subplots(figsize=(6, 4))
+    fig.patch.set_facecolor(COI_BG)
+    ax.set_facecolor(COI_BG)
+
+    ax.text(
         0.5,
-        0.6,
-        "Aucun système suspecté\ndans les 5 prochains jours\nsur le Sud-Ouest de l'océan Indien",
+        0.65,
+        "Aucun système suspecté\npour les 5 prochains jours\nsur l'océan Indien Sud",
         ha="center",
         va="center",
         fontsize=14,
+        color=COI_TEXT,
         wrap=True,
+        transform=ax.transAxes,
     )
-    plt.text(
+    ax.text(
         0.5,
-        0.25,
-        f"Run ECMWF : {RUN_DATE:%Y-%m-%d 00Z}",
+        0.35,
+        subtitle,
         ha="center",
         va="center",
         fontsize=10,
+        color="#aaaaaa",
+        transform=ax.transAxes,
     )
-    plt.axis("off")
+
+    ax.axis("off")
     plt.tight_layout(pad=0.5)
-    plt.savefig(path, bbox_inches="tight", pad_inches=0.3, dpi=150)
+    plt.savefig(path, bbox_inches="tight", pad_inches=0.3, dpi=150, facecolor=COI_BG)
+    plt.close()
+
+
+def create_ensemble_overview_png(locations_f, locations_avg, png_path, storm_id):
+    """
+    Crée une vue simple des trajectoires d'ensemble + trajectoire moyenne
+    au style CycloneOI (pas une carte complète, mais un aperçu clair).
+    """
+    fig, ax = plt.subplots(figsize=(6.5, 5))
+    fig.patch.set_facecolor(COI_BG)
+    ax.set_facecolor(COI_BG)
+
+    # Trajectoires d'ensemble
+    for locs in locations_f:
+        lats = [lat for (lat, lon) in locs]
+        lons = [lon for (lat, lon) in locs]
+        ax.plot(lons, lats, linewidth=0.8, alpha=0.4, color="#4ade80")  # vert clair
+
+    # Trajectoire moyenne
+    if locations_avg:
+        lat_avg = [lat for (lat, lon) in locations_avg]
+        lon_avg = [lon for (lat, lon) in locations_avg]
+        ax.plot(lon_avg, lat_avg, linewidth=2.0, color=COI_GOLD, label="Trajectoire moyenne")
+
+    ax.set_xlabel("Longitude", color=COI_TEXT)
+    ax.set_ylabel("Latitude", color=COI_TEXT)
+
+    # Limites auto + petite marge
+    all_lats = [lat for locs in locations_f for (lat, lon) in locs]
+    all_lons = [lon for locs in locations_f for (lat, lon) in locs]
+    if all_lats and all_lons:
+        margin = 2.0
+        ax.set_xlim(min(all_lons) - margin, max(all_lons) + margin)
+        ax.set_ylim(min(all_lats) - margin, max(all_lats) + margin)
+
+    for spine in ax.spines.values():
+        spine.set_color("#444444")
+
+    ax.tick_params(colors="#bbbbbb", labelsize=8)
+
+    ax.set_title(
+        f"Ensembles ECMWF – Système {storm_id}",
+        fontsize=13,
+        color=COI_GOLD,
+        pad=10,
+    )
+
+    if locations_avg:
+        ax.legend(facecolor=COI_BG, edgecolor="#555555", labelcolor=COI_TEXT)
+
+    plt.tight_layout(pad=0.7)
+    plt.savefig(png_path, bbox_inches="tight", pad_inches=0.2, dpi=150, facecolor=COI_BG)
     plt.close()
 
 
@@ -218,9 +297,17 @@ def process_storm(df_storms_forecast, storm_id):
     target_tif = storm_dir / "strike_probability.tif"
     shutil.copy(tif_path, target_tif)
 
-    # PNG pour le site
+    # PNG cyclogenèse
     target_png = storm_dir / "strike_probability.png"
-    save_strike_map_png(target_tif, target_png)
+    save_strike_map_png(
+        target_tif,
+        target_png,
+        title="Cyclogenèse à 5 jours – Océan Indien Sud"
+    )
+
+    # PNG ensembles
+    ens_png = storm_dir / "ensemble_tracks.png"
+    create_ensemble_overview_png(locations_f, locations_avg, ens_png, storm_id)
 
     print(f"    -> fichiers générés dans {storm_dir}")
 
@@ -228,7 +315,7 @@ def process_storm(df_storms_forecast, storm_id):
 # ================== MAIN ==================
 
 def main():
-    print(f"=== Génération produits SOI pour run {RUN_DATE} ===")
+    print(f"=== Génération produits IO Sud pour run {RUN_DATE:%Y-%m-%d} ===")
 
     # 1) Télécharger les données ECMWF (BUFR) si nécessaire
     print("Téléchargement des données ECMWF (download_tracks_forecast)…")
@@ -238,15 +325,20 @@ def main():
     print("Téléchargement / chargement des données ECMWF (create_storms_df)…")
     df_storms = tracks.create_storms_df(start_date)
 
+    subtitle = f"Run ECMWF : {start_date:%Y-%m-%d}"
+
     if df_storms.empty:
         print("Aucune tempête détectée dans les données ECMWF.")
-        placeholder_path = LATEST_DIR / "strike_probability.png"
-        create_placeholder_png(placeholder_path)
-        print(f"  -> Placeholder généré : {placeholder_path}")
+        # Placeholders dans /latest
+        create_placeholder_png(LATEST_DIR / "cyclogenesis.png", subtitle)
+        create_placeholder_png(LATEST_DIR / "ensemble_tracks.png", subtitle)
+        # compat ancien chemin
+        create_placeholder_png(LATEST_DIR / "strike_probability.png", subtitle)
+        print(f"  -> Placeholders générés dans {LATEST_DIR}")
         return
 
-    # 3) Filtrer le bassin Sud-Ouest océan Indien
-    print("Filtrage sur le bassin Sud-Ouest océan Indien…")
+    # 3) Filtrer le bassin Océan Indien Sud
+    print("Filtrage sur le bassin Océan Indien Sud…")
 
     df_basin = df_storms[
         (df_storms.latitude < LAT_MAX) &
@@ -257,33 +349,45 @@ def main():
     ].copy()
 
     if df_basin.empty:
-        print("Aucun système suivi dans le bassin SOI pour ce run.")
-        # On génère quand même une image "placeholder" dans output/latest
-        placeholder_path = LATEST_DIR / "strike_probability.png"
-        create_placeholder_png(placeholder_path)
-        print(f"  -> Placeholder généré : {placeholder_path}")
+        print("Aucun système suivi dans l'océan Indien Sud pour ce run.")
+        create_placeholder_png(LATEST_DIR / "cyclogenesis.png", subtitle)
+        create_placeholder_png(LATEST_DIR / "ensemble_tracks.png", subtitle)
+        create_placeholder_png(LATEST_DIR / "strike_probability.png", subtitle)
+        print(f"  -> Placeholders générés dans {LATEST_DIR}")
         return
 
     storm_ids = sorted(df_basin.stormIdentifier.unique())
-    print(f"Systèmes identifiés dans le SOI : {storm_ids}")
+    print(f"Systèmes identifiés dans l'océan Indien Sud : {storm_ids}")
 
     # 4) Traiter chaque système
     for sid in storm_ids:
         process_storm(df_basin, sid)
 
-    # 5) Copier la carte du premier système vers output/latest/strike_probability.png
+    # 5) Copier la carte du premier système vers output/latest/
     first_storm_dir = BASE_OUTPUT / f"storm_{storm_ids[0]}"
-    source_png = first_storm_dir / "strike_probability.png"
-    latest_png = LATEST_DIR / "strike_probability.png"
 
-    if source_png.exists():
-        shutil.copy(source_png, latest_png)
-        print(f"\nImage principale copiée vers : {latest_png}")
+    # cyclogenèse
+    src_cyclo = first_storm_dir / "strike_probability.png"
+    latest_cyclo = LATEST_DIR / "cyclogenesis.png"
+    compat_old = LATEST_DIR / "strike_probability.png"
+
+    if src_cyclo.exists():
+        shutil.copy(src_cyclo, latest_cyclo)
+        shutil.copy(src_cyclo, compat_old)
     else:
-        # sécurité : si jamais pas d'image, on met un placeholder
-        create_placeholder_png(latest_png)
-        print(f"\nPas trouvé {source_png}, placeholder généré à la place.")
+        create_placeholder_png(latest_cyclo, subtitle)
+        create_placeholder_png(compat_old, subtitle)
 
+    # ensembles
+    src_ens = first_storm_dir / "ensemble_tracks.png"
+    latest_ens = LATEST_DIR / "ensemble_tracks.png"
+
+    if src_ens.exists():
+        shutil.copy(src_ens, latest_ens)
+    else:
+        create_placeholder_png(latest_ens, subtitle)
+
+    print(f"\nImages 'latest' mises à jour dans {LATEST_DIR}")
     print("\n✅ Génération terminée.")
 
 
