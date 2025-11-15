@@ -7,11 +7,18 @@ pour le Sud-Ouest océan Indien à partir des données ECMWF,
 en réutilisant les fonctions de TropiDash.
 
 Résultat : pour chaque système identifié dans le bassin,
-on produit dans output/<storm_id>/ :
+on produit dans output/YYYYMMDD/storm_<id>/ :
   - ensemble_tracks.geojson
   - mean_track.geojson
   - strike_probability.tif
-  - strike_probability.png  (carte prête à être affichée sur e-monsite)
+  - strike_probability.png
+
+En plus, on crée toujours :
+
+  output/latest/strike_probability.png
+
+- s'il y a des systèmes : copie de la carte du premier système
+- s'il n'y a aucun système : image "aucun risque de cyclogenèse"
 """
 
 from pathlib import Path
@@ -22,6 +29,7 @@ import shutil
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 import rasterio
 
 from tropidash_utils import utils_tracks as tracks
@@ -31,8 +39,7 @@ from tropidash_utils import utils_tracks as tracks
 
 # Si tu veux forcer une date de run depuis le workflow :
 #   env:
-#     COI_RUN_DATE: ${{ steps.date.outputs.date }}
-# au format YYYYMMDD
+#     COI_RUN_DATE: YYYYMMDD
 run_date_str = os.environ.get("COI_RUN_DATE")
 
 if run_date_str:
@@ -42,13 +49,18 @@ else:
     now = datetime.utcnow()
     RUN_DATE = datetime(now.year, now.month, now.day, 0, 0)
 
-# Dossiers
+# Dossiers de sortie
 BASE_OUTPUT = Path("output") / RUN_DATE.strftime("%Y%m%d")
 BASE_OUTPUT.mkdir(parents=True, exist_ok=True)
 
+# Dossier "latest" qui contiendra toujours l'image à afficher sur le site
+LATEST_DIR = Path("output") / "latest"
+LATEST_DIR.mkdir(parents=True, exist_ok=True)
+
+# Dossiers de données brutes
 DATA_DIR = Path("data")
 TRACKS_DIR = DATA_DIR / "tracks"
-TRACKS_DIR.mkdir(parents=True, exist_ok=True)  # important pour le téléchargement BUFR
+TRACKS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Boîte géographique Sud-Ouest océan Indien
 LON_MIN = 20.0
@@ -106,7 +118,6 @@ def save_strike_map_png(tif_path, png_path):
     ]
 
     plt.figure(figsize=(8, 6))
-    from matplotlib.colors import ListedColormap
     plt.imshow(
         data,
         extent=(bounds.left, bounds.right, bounds.bottom, bounds.top),
@@ -116,6 +127,35 @@ def save_strike_map_png(tif_path, png_path):
     plt.axis("off")
     plt.tight_layout(pad=0)
     plt.savefig(png_path, bbox_inches="tight", pad_inches=0, dpi=150)
+    plt.close()
+
+
+def create_placeholder_png(path):
+    """
+    Crée une image simple indiquant qu'aucun système n'est suivi
+    dans le Sud-Ouest océan Indien pour les 5 prochains jours.
+    """
+    plt.figure(figsize=(6, 4))
+    plt.text(
+        0.5,
+        0.6,
+        "Aucun système suspecté\ndans les 5 prochains jours\nsur le Sud-Ouest de l'océan Indien",
+        ha="center",
+        va="center",
+        fontsize=14,
+        wrap=True,
+    )
+    plt.text(
+        0.5,
+        0.25,
+        f"Run ECMWF : {RUN_DATE:%Y-%m-%d 00Z}",
+        ha="center",
+        va="center",
+        fontsize=10,
+    )
+    plt.axis("off")
+    plt.tight_layout(pad=0.5)
+    plt.savefig(path, bbox_inches="tight", pad_inches=0.3, dpi=150)
     plt.close()
 
 
@@ -200,6 +240,9 @@ def main():
 
     if df_storms.empty:
         print("Aucune tempête détectée dans les données ECMWF.")
+        placeholder_path = LATEST_DIR / "strike_probability.png"
+        create_placeholder_png(placeholder_path)
+        print(f"  -> Placeholder généré : {placeholder_path}")
         return
 
     # 3) Filtrer le bassin Sud-Ouest océan Indien
@@ -215,6 +258,10 @@ def main():
 
     if df_basin.empty:
         print("Aucun système suivi dans le bassin SOI pour ce run.")
+        # On génère quand même une image "placeholder" dans output/latest
+        placeholder_path = LATEST_DIR / "strike_probability.png"
+        create_placeholder_png(placeholder_path)
+        print(f"  -> Placeholder généré : {placeholder_path}")
         return
 
     storm_ids = sorted(df_basin.stormIdentifier.unique())
@@ -223,6 +270,19 @@ def main():
     # 4) Traiter chaque système
     for sid in storm_ids:
         process_storm(df_basin, sid)
+
+    # 5) Copier la carte du premier système vers output/latest/strike_probability.png
+    first_storm_dir = BASE_OUTPUT / f"storm_{storm_ids[0]}"
+    source_png = first_storm_dir / "strike_probability.png"
+    latest_png = LATEST_DIR / "strike_probability.png"
+
+    if source_png.exists():
+        shutil.copy(source_png, latest_png)
+        print(f"\nImage principale copiée vers : {latest_png}")
+    else:
+        # sécurité : si jamais pas d'image, on met un placeholder
+        create_placeholder_png(latest_png)
+        print(f"\nPas trouvé {source_png}, placeholder généré à la place.")
 
     print("\n✅ Génération terminée.")
 
