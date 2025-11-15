@@ -1,196 +1,226 @@
-#!/usr/bin/env python3
-"""
-CycloneOI – SOI 5-day wind hazard (proxy cyclone)
--------------------------------------------------
-Produit automatique basé sur l'Open Data ECMWF :
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
-- Paramètre : 10fgg25 = prob. rafales 10 m > 25 m/s (%)
-- Domaine : Océan Indien Sud
-- Sorties :
-    output/soi_wg25_prob_map.png
-    output/soi_wg25_prob_timeseries.png
+"""
+Génération quotidienne des produits de cyclogenèse à 5 jours
+pour le Sud-Ouest océan Indien à partir des données ECMWF,
+en réutilisant les fonctions de TropiDash.
+
+Résultat : pour chaque système identifié dans le bassin,
+on produit dans output/<storm_id>/ :
+  - ensemble_tracks.geojson
+  - mean_track.geojson
+  - strike_probability.tif
+  - strike_probability.png  (carte prête à être affichée sur e-monsite)
 """
 
+from pathlib import Path
+from datetime import datetime
 import os
-import datetime as dt
+import json
+import shutil
 
 import numpy as np
-import xarray as xr
 import matplotlib.pyplot as plt
-from ecmwf.opendata import Client
+import rasterio
 
-OUTPUT_DIR = "output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Domaine Océan Indien Sud
-DOMAIN = {
-    "north": 5.0,
-    "south": -35.0,
-    "west": 20.0,
-    "east": 100.0,
-}
-
-# Steps de prévision (heures) disponibles pour les probabilités ENS
-STEPS = [24, 48, 72, 96, 120, 144]
-
-# Paramètre Open Data : probabilité rafales >= 25 m/s
-PARAM = "10fgg25"
-
-GRIB_FILE = os.path.join(OUTPUT_DIR, "wg25_prob.grib2")
+from tropidash_utils import utils_tracks as tracks
 
 
-def latest_run_date():
-    """Prend le run 00Z le plus récent, en restant prudent sur la dispo."""
-    now = dt.datetime.utcnow()
-    if now.hour < 6:
-        run = now - dt.timedelta(days=1)
-    else:
-        run = now
-    return run.strftime("%Y-%m-%d")
+# ================== PARAMÈTRES GÉNÉRAUX ==================
+
+# Si tu veux forcer une date de run depuis le workflow :
+#   env:
+#     COI_RUN_DATE: ${{ steps.date.outputs.date }}
+# au format YYYYMMDD
+run_date_str = os.environ.get("COI_RUN_DATE")
+
+if run_date_str:
+    RUN_DATE = datetime.strptime(run_date_str, "%Y%m%d")
+else:
+    # par défaut : date UTC du jour à 00Z
+    now = datetime.utcnow()
+    RUN_DATE = datetime(now.year, now.month, now.day, 0, 0)
+
+# Dossier de sortie
+BASE_OUTPUT = Path("output") / RUN_DATE.strftime("%Y%m%d")
+BASE_OUTPUT.mkdir(parents=True, exist_ok=True)
+
+# Boîte géographique Sud-Ouest océan Indien
+LON_MIN = 20.0
+LON_MAX = 120.0
+LAT_MIN = -45.0   # Sud
+LAT_MAX = 0.0     # Équateur
+
+# On enlève les "faux" systèmes (recommandation du tuto TropiDash)
+MIN_STORM_ID = 70  # stormIdentifier >= 70
 
 
-def download_data():
-    date = latest_run_date()
-    print(f"[INFO] Downloading ENS probabilities for {date} 00 UTC")
+# ================== FONCTIONS UTILITAIRES ==================
 
-    client = Client(source="ecmwf")
+def to_geojson_linestring_list(locs_list, properties_list=None):
+    """
+    Convertit une liste de trajectoires (listes de (lat, lon))
+    en FeatureCollection GeoJSON de LineString.
+    """
+    features = []
 
-    client.retrieve(
-        date=date,
-        time=0,
-        stream="enfo",
-        type="ep",          # ensemble probabilities
-        step=STEPS,
-        param=PARAM,
-        target=GRIB_FILE,
-    )
-    print(f"[INFO] GRIB saved to {GRIB_FILE}")
+    for i, locs in enumerate(locs_list):
+        coords = [[float(lon), float(lat)] for (lat, lon) in locs]
+        props = {"member": i}
+        if properties_list is not None and i < len(properties_list):
+            props.update(properties_list[i])
 
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": coords},
+                "properties": props,
+            }
+        )
 
-def load_domain():
-    if not os.path.exists(GRIB_FILE):
-        raise FileNotFoundError(GRIB_FILE)
-
-    print("[INFO] Opening GRIB with xarray/cfgrib")
-    ds = xr.open_dataset(
-        GRIB_FILE,
-        engine="cfgrib",
-        backend_kwargs={"filter_by_keys": {"typeOfLevel": "surface"}},
-    )
-
-    # Le nom de variable ne peut pas commencer par un chiffre en Python.
-    # On prend donc la première variable trouvée.
-    var_name = list(ds.data_vars)[0]
-    da = ds[var_name]
-
-    lat = da.latitude
-    lon = da.longitude
-
-    # Gestion du sens des latitudes
-    if lat[0] > lat[-1]:
-        lat_slice = slice(DOMAIN["north"], DOMAIN["south"])
-    else:
-        lat_slice = slice(DOMAIN["south"], DOMAIN["north"])
-
-    lon_slice = slice(DOMAIN["west"], DOMAIN["east"])
-
-    da_dom = da.sel(latitude=lat_slice, longitude=lon_slice)
-
-    print(
-        "[INFO] Domain subset:",
-        f"lat {float(da_dom.latitude.max()):.1f} to {float(da_dom.latitude.min()):.1f},",
-        f"lon {float(da_dom.longitude.min()):.1f} to {float(da_dom.longitude.max()):.1f}",
-    )
-
-    return da_dom
+    return {"type": "FeatureCollection", "features": features}
 
 
-def build_windows(da):
-    """Construit les fenêtres 24–48, 48–72, 72–96, 96–120, 120–144."""
-    steps = da.step.values
+def save_strike_map_png(tif_path, png_path):
+    """
+    Convertit le GeoTIFF de strike probability en PNG simple
+    (sans axes) pour affichage direct sur le site.
+    """
+    with rasterio.open(tif_path) as r:
+        data = r.read(1)
+        bounds = r.bounds
 
-    def max_range(a, b):
-        valid_steps = [s for s in steps if a <= int(s) <= b]
-        return da.sel(step=valid_steps).max(dim="step")
+    # On masque les zéros (pas de probabilité)
+    data = np.ma.masked_where(data <= 0, data)
 
-    windows = {
-        "24-48": max_range(24, 48),
-        "48-72": max_range(48, 72),
-        "72-96": max_range(72, 96),
-        "96-120": max_range(96, 120),
-        "120-144": max_range(120, 144),
-    }
-    return windows
-
-
-def make_map(da):
-    """Carte du max sur 5 jours de la probabilité rafales >= 25 m/s."""
-    prob_max = da.max(dim="step")
-
-    lats = prob_max.latitude.values
-    lons = prob_max.longitude.values
-
-    lat_min = float(lats.min())
-    lat_max = float(lats.max())
-    lon_min = float(lons.min())
-    lon_max = float(lons.max())
+    # Palette inspirée de TropiDash
+    # (du vert faible au bleu / violet fort)
+    palette = [
+        "#8df52c", "#6ae24c", "#61bb30", "#508b15",
+        "#057941", "#2397d1", "#557ff3", "#143cdc",
+        "#3910b4", "#1e0063"
+    ]
 
     plt.figure(figsize=(8, 6))
-    im = plt.imshow(
-        prob_max.values,
-        origin="lower",
-        extent=[lon_min, lon_max, lat_min, lat_max],
-        vmin=0,
-        vmax=100,
-        aspect="auto",
-        cmap="plasma",  # tu pourras changer la palette ici
+    # imshow avec extent pour être géoréférencé si tu veux l'utiliser
+    plt.imshow(
+        data,
+        extent=(bounds.left, bounds.right, bounds.bottom, bounds.top),
+        origin="upper"
     )
-    plt.colorbar(im, label="Probabilité rafales ≥ 25 m/s (%)")
-    plt.title("ECMWF ENS – Signal vent violent 5 jours (Océan Indien Sud)")
-    plt.xlabel("Longitude")
-    plt.ylabel("Latitude")
-    plt.tight_layout()
+    # on applique une colormap discrète
+    from matplotlib.colors import ListedColormap
+    plt.set_cmap(ListedColormap(palette))
 
-    out_path = os.path.join(OUTPUT_DIR, "soi_wg25_prob_map.png")
-    plt.savefig(out_path, dpi=150)
+    plt.axis("off")
+    plt.tight_layout(pad=0)
+    plt.savefig(png_path, bbox_inches="tight", pad_inches=0, dpi=150)
     plt.close()
-    print(f"[INFO] Saved map to {out_path}")
 
 
-def make_timeseries(windows):
-    """Courbe d’évolution du signal (max spatial par fenêtre temporelle)."""
-    x_days = [1.5, 2.5, 3.5, 4.5, 5.5]  # centres approx des fenêtres
-    labels = ["24–48", "48–72", "72–96", "96–120", "120–144"]
+def process_storm(df_storms_forecast, storm_id):
+    """
+    Traite un système donné (stormIdentifier) :
+      - calcule les trajectoires
+      - calcule la strike probability map
+      - sauvegarde GeoJSON + TIF + PNG
+    """
+    df_storm = df_storms_forecast[df_storms_forecast.stormIdentifier == storm_id].copy()
+    if df_storm.empty:
+        return
 
-    y_probs = []
-    for key in ["24-48", "48-72", "72-96", "96-120", "120-144"]:
-        y_probs.append(float(windows[key].max().values))
+    # Dossier de sortie pour ce système
+    storm_dir = BASE_OUTPUT / f"storm_{storm_id}"
+    storm_dir.mkdir(parents=True, exist_ok=True)
 
-    plt.figure(figsize=(7, 4))
-    plt.plot(x_days, y_probs, marker="o")
-    plt.xticks(x_days, labels, rotation=30)
-    plt.grid(True, alpha=0.3)
-    plt.xlabel("Fenêtre temporelle (h)")
-    plt.ylabel("Proba max rafales ≥ 25 m/s (%)")
-    plt.title("Évolution du signal vent violent (Océan Indien Sud)")
-    plt.tight_layout()
+    print(f"  > Système {storm_id} : {len(df_storm)} points")
 
-    out_path = os.path.join(OUTPUT_DIR, "soi_wg25_prob_timeseries.png")
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-    print(f"[INFO] Saved time series to {out_path}")
+    # === Trajectoires d'ensemble ===
+    locations_f, timesteps_f, pressures_f, wind_speeds_f = tracks.forecast_tracks_locations(df_storm)
 
+    ens_props = []
+    for i in range(len(locations_f)):
+        ens_props.append(
+            {
+                "timesteps": [str(t) for t in timesteps_f[i]],
+                "pressure_hpa": [float(p) for p in pressures_f[i]],
+                "wind_ms": [float(w) for w in wind_speeds_f[i]],
+            }
+        )
+
+    ens_geojson = to_geojson_linestring_list(locations_f, ens_props)
+    (storm_dir / "ensemble_tracks.geojson").write_text(
+        json.dumps(ens_geojson, ensure_ascii=False)
+    )
+
+    # === Trajectoire moyenne ===
+    locations_avg, timesteps_avg, pressures_avg, wind_speeds_avg = tracks.mean_forecast_track(
+        df_storm
+    )
+
+    mean_props = [
+        {
+            "timesteps": [str(t) for t in timesteps_avg],
+            "pressure_percentiles_hpa": [[float(x) for x in row] for row in pressures_avg],
+            "wind_percentiles_ms": [[float(x) for x in row] for row in wind_speeds_avg],
+        }
+    ]
+    mean_geojson = to_geojson_linestring_list([locations_avg], mean_props)
+    (storm_dir / "mean_track.geojson").write_text(
+        json.dumps(mean_geojson, ensure_ascii=False)
+    )
+
+    # === Strike probability map ===
+    strike_map_xr, tif_path = tracks.strike_probability_map(df_storm)
+    tif_path = Path(tif_path)
+
+    target_tif = storm_dir / "strike_probability.tif"
+    shutil.copy(tif_path, target_tif)
+
+    # PNG pour le site
+    target_png = storm_dir / "strike_probability.png"
+    save_strike_map_png(target_tif, target_png)
+
+    print(f"    -> fichiers générés dans {storm_dir}")
+
+
+# ================== MAIN ==================
 
 def main():
-    try:
-        download_data()
-        da_dom = load_domain()
-        windows = build_windows(da_dom)
-        make_map(da_dom)
-        make_timeseries(windows)
-        print("[INFO] All products generated successfully.")
-    except Exception as e:
-        print("[ERROR]", e)
+    print(f"=== Génération produits SOI pour run {RUN_DATE} ===")
+
+    # 1) Charger toutes les tempêtes à partir de la date RUN_DATE
+    print("Téléchargement / chargement des données ECMWF (create_storms_df)…")
+    df_storms = tracks.create_storms_df(RUN_DATE)
+
+    if df_storms.empty:
+        print("Aucune tempête détectée dans les données ECMWF.")
+        return
+
+    # 2) Filtrer le bassin Sud-Ouest océan Indien
+    print("Filtrage sur le bassin Sud-Ouest océan Indien…")
+
+    df_basin = df_storms[
+        (df_storms.latitude < LAT_MAX) &
+        (df_storms.latitude > LAT_MIN) &
+        (df_storms.longitude >= LON_MIN) &
+        (df_storms.longitude <= LON_MAX) &
+        (df_storms.stormIdentifier.astype(int) >= MIN_STORM_ID)
+    ].copy()
+
+    if df_basin.empty:
+        print("Aucun système suivi dans le bassin SOI pour ce run.")
+        return
+
+    storm_ids = sorted(df_basin.stormIdentifier.unique())
+    print(f"Systèmes identifiés dans le SOI : {storm_ids}")
+
+    # 3) Traiter chaque système
+    for sid in storm_ids:
+        process_storm(df_basin, sid)
+
+    print("\n✅ Génération terminée.")
 
 
 if __name__ == "__main__":
