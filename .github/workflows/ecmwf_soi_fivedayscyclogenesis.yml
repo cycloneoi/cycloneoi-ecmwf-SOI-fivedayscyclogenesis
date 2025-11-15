@@ -1,10 +1,7 @@
 name: ECMWF SOI – 5 days cyclogenesis (Pages)
 
 on:
-  # Lancement manuel
   workflow_dispatch:
-
-  # Lancement automatique chaque jour à 02h30 UTC
   schedule:
     - cron: "30 2 * * *"
 
@@ -43,15 +40,14 @@ jobs:
             pdbufr scipy ipyleaflet ipywidgets branca \
             localtileserver ecmwf-opendata eccodes
 
+      # 🔴 ICI LA MODIF IMPORTANTE : on ajoute PYTHONPATH=.
       - name: Run SOI 5-days cyclogenesis generator
         run: |
-          python scripts/generate_soi_fivedayscyclogenesis.py
+          PYTHONPATH=. python scripts/generate_soi_fivedayscyclogenesis.py
 
       - name: Prepare GitHub Pages artifact
         run: |
           mkdir -p public
-          # On copie tout ce qui a été généré dans output/
-          # vers public/ qui sera publié sur GitHub Pages
           if [ -d "output" ]; then
             cp -r output/* public/
           fi
